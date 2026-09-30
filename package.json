@@ -1,0 +1,34 @@
+{
+  "name": "@workspace/dsh-jp-translate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "日语翻译 agent preset for DSH: a tool-free translation mode whose every model request carries ONLY the system prompt and the user's source text — no history. The system prompt is the fixed translation contract; the [Glossaries] term pairs come from preset-based settings edited in the Web settings page through two text boxes (原始文本 / 翻译文本), saved as selectable presets.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./preset": "./presets/jp-translate.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  }
+}

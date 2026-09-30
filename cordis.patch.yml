@@ -1,0 +1,13 @@
+# dsh-jp-translate bundle patch: inserts the host plugin row into the web
+# profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field) over dsh-base.
+#
+# The row is a bare plugin by package name: the node half (exports ".") runs in
+# the host process and declares the bundled 日语翻译 agent preset to the
+# agent-preset registry at activation (declare = enabled), so the preset is
+# selectable for new sessions without writing anything into the harness home.
+# The browser half (exports "./client") adds the 日语翻译 page to Settings with
+# the glossary preset editor.
+- insert:
+    - id: jp-translate
+      name: '@workspace/dsh-jp-translate'
