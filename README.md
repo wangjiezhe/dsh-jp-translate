@@ -13,6 +13,34 @@
 | 术语表可编辑 | 设置页「日语翻译」：预设选择器 + 「原始文本」「翻译文本」两个文本框，按行一一对应 |
 | 可保存为预设 | 新建 / 复制 / 删除 / 命名，保存后写入该插件 profile entry 的唯一 volatile 配置字段，host 随即用新术语表重新声明 agent 预设 |
 
+## 适配 DSH 0.2.2-rc.5
+
+升级到 0.2.2-rc.5 后本插件每一轮都失败：
+
+```
+本轮运行失败Cannot read properties of undefined (reading 'length')
+UNKNOWN
+```
+
+根因是 DSH **0.2.1-rc.2** 的破坏性变更 `conditional-tools`：`system-prompt/assemble`
+的 payload（`PromptPresentation`）不再携带 `tools`，工具声明只来自步骤准入的
+`ResolvedToolSet` 与执行器插件的 `describe()`。插件旧代码在 assemble 监听器里读
+`assembly.tools.length`，字段为 `undefined` 于是整轮报错。**这不是加 `?.` 能修的问题**：
+那个 waterfall 里过滤工具已经无效。修法是删掉 assemble 监听器，用
+`tools.restrict({ allow: [] })` 清空步骤准入集合，并在预设作用域选一个
+`describe() => ({ schemas: [] })` 的 no-tools 执行器——这样连 PTC 的保留 `run_code`
+传输也不会被声明，见下文契约 5。
+
+同一轮升级还暴露了第二个 0.2.2-rc.5 变更：loop 改为在 `step()` 里自行投影 runtime
+context 并 append，`agent/pre-step` 过滤 decision 已拦不住它；且历史遮蔽每轮覆盖快照节点
+会让 `RuntimeContextProjection` 每轮重发「context: none」清空提醒。插件现在在
+`agent/request` 里清掉 loop 的 `retained` 状态（契约 6 的端三）。
+
+测试环境也一起迁到了 0.2.2-rc.5：`tools/dsh-env/node_modules` 由
+`tools/extract-rc5-env.mjs` 从**正在运行的** `app.asar` 解出（`.dsh-version.json` 记录
+版本）。之前那份是 0.2.0-rc.2，所以 spec 全绿而上线即坏——这正是「测试环境必须等于
+运行版本」的教训。DSH 再升级后请先重新解出，再跑 spec。
+
 ## 安装
 
 ```powershell
@@ -142,64 +170,89 @@ client.js               浏览器半：设置页（两个文本框 + 预设管�
    这条也是**事故的一部分**：写进日志的每一行都要能过读取器，`agent/pre-step` 那次修复
    只顾了「写进去能跑」，没顾「读回来能过」。
 
-5. **「不加载任何工具」需要两步，且 `complete` 段只管提示词、不管 `tools` 数组。**
-   `complete: true` 只让本段成为**全部提示词**，请求体里的 `tools` 是另一路：
-   `ToolRuntime` 在构造时向 `ctx.systemPrompt` 注册一个 tool provider，装配时把
-   schema 收进 `assembly.tools`，再由 `dsh-agent-loop` 的
-   `buildRequest(config, preparedCall, assembly.tools, …)` 放进请求（空数组则整键省略）。
-   所以预设内插件要同时做两件事：
+5. **「不加载任何工具」现在只能靠「让步骤解析出的工具集为空」。**
+   `complete: true` 只让本段成为**全部提示词**，请求体里的 `tools` 是另一路。
+   DSH **0.2.1-rc.2** 起，工具声明只来自**步骤准入的注册**：
+   `AgentLoop.preStep` 先 `tools.resolve({ agent, modelSelection, signal })` 得到该步骤的
+   `ResolvedToolSet`，`ToolRuntime` 再用 `definitions(scope, toolSet)` 描述它，装配成
+   `assembly.tools`；`system-prompt/assemble` 的 `PromptPresentation` **不再有 `tools` 字段**，
+   waterfall 返回的 `tools` 也会被忽略（升级指南 `v0.2.1-rc.2/conditional-tools`）。
+
+   所以预设内插件做两件事：
 
    ```js
-   // 端一：无论别的插件贡献了什么 schema，线上一律为空
-   ctx.effect(() => ctx.on('system-prompt/assemble', async (_a, _c, next) => {
-     const assembly = await next()
-     return assembly.tools.length === 0 ? assembly : { ...assembly, tools: [] }
-   }), 'jp-translate: no tool declarations')
-
-   // 端二：本预设作用域内任何工具都解析不到（模型硬编出工具名也不会执行）
-   ctx.inject(['tools'], scoped => { scoped.tools.restrict({ allow: [] }) })
+   ctx.inject(['tools'], scoped => {
+     scoped.tools.restrict({ allow: [] })                 // 步骤准入集合为空
+     scoped.tools.setExecutor(NO_TOOLS_EXECUTOR)          // 声明方为空（连 PTC 的 run_code 也不声明）
+   })
    ```
 
-   两个要点：
+   第一行让链上每个 agent 的 `resolve()` 看到空视图。第二行是 0.2.1-rc.2 之后的
+   **声明方**：从前 `ToolRuntime` 自己描述工具，现在由「执行器插件」的 `describe()`
+   决定；部署若选了 PTC，它的 `describe()` **无论有没有工具都会声明保留的 `run_code`
+   传输**，而 `tools.restrict()` 明确禁止点名 `run_code`。本预设在自己的作用域里选一个
+   `describe: () => ({ schemas: [] })` 的只读执行器，于是无论部署根作用域选了什么执行器，
+   本预设声明出的 `tools` 都是空；请求体整个省略 `tools`，模型硬编出的工具名也解析不到
+   （`UNKNOWN_TOOL`）。执行器位于预设作用域，别的 agent 照旧用部署的执行器。
 
-   - **作用域是「预设 standing scope」，不是进程全局。** dsh-scope 的
-     `bindScopeParent(agentKey, presetKey)` 让注册视图沿链**向下**继承、事件准入沿链
-     **向上**扩展，因此同一个进程里别的 agent 工具照旧。`tools.restrict()` 只在
-     有 scope 的上下文里可用（这正是它要求的 `agent.ctx`）。
-   - **`tools` 只能可选注入（`ctx.inject(['tools'], …)`）**，不能写进 `inject` 数组：
-     没编入工具行的部署本来就没工具可抑制，硬注入会让这一行永远 pending。
+   **0.2.2-rc.5 的报错正是漏改了这一条**：旧代码在 `system-prompt/assemble` 里读
+   `assembly.tools.length`，而该字段已不存在：
 
-   `run-notools.mjs` 用**真实的** `SystemPrompt` + `ToolRuntime` + 真实 scope 链，
-   按 agent loop 的方式寻址装配（`assemble({ scope: <scope KEY> })`）来钉住三条：
-   装上预设后 `assembly.tools` 为空且 `tools.get(name, key)` 解析不到；**不装预设的
-   对照组仍带全部工具**（否则这条测试可能因为「什么都没生效」而假绿）；兄弟 agent 不受影响。
+   ```
+   Cannot read properties of undefined (reading 'length')
+   UNKNOWN
+   ```
+
+   这不是「加个 `?.`」就能修好的问题——**在那个 waterfall 里过滤工具已经无效**，
+   删除监听器、把抑制收到 `tools.restrict()` + 作用域执行器才是迁移方向。`run-preset.mjs`
+   因此会直接读源码断言那里不再有 assemble 监听；`run-notools.mjs` 用真实
+   `SystemPrompt + ToolRuntime + native executor + scope 链 + tools.resolve()` 钉住
+   「准入集合为空 → `assembly.tools` 为空」以及对照组、兄弟 agent，并额外用一个
+   PTC 风格的根执行器证明「连 `run_code` 也不会声明」。
+
+   `tools` 仍然只能可选注入（`ctx.inject(['tools'], …)`）：没编入工具行的部署本来就没
+   工具可抑制，硬注入会让这一行永远 pending。
 
    一个已知边角：**在本改动之前就已存在的旧会话**，第一次在新代码下发请求时，
    `dsh-agent-loop.buildRequest` 会发现自己记录的 header 里有工具、现在没有了，于是补一条
    `source.kind = 'tool-registry'` 的 tool-removal `developer/message`（并进入本轮请求）。
-   这是 harness 自己写的事实变更记录，我们的 pre-step 遮蔽在它之前执行、够不到它；
-   下一轮起它就被遮蔽了。**新建会话永远是干净的 `[system][user]`**。
+   这是 harness 自己写的事实变更记录，我们的遮蔽在它之前执行、够不到它；下一轮起它就被
+   遮蔽了。**新建会话永远是干净的 `[system][user]`**。
 
-6. **「不发运行时上下文」是第三路，`complete` 段和表面遮蔽都够不到它。**
-   请求里多出来的那条 user 消息（`Current runtime context. This snapshot supersedes…`）
-   不是提示词段，也不是 surface 上的历史：`dsh-agent-loop` 自己渲染
+6. **「不发运行时上下文」在 0.2.2-rc.5 多了一条：必须清掉 loop 的 `retained` 状态。**
+   请求里多出来的那条 user 消息（`Current runtime context…`）不是提示词段，也不是
+   surface 上的历史：`dsh-agent-loop` 自己渲染
    `joinContextSections(renderContextSections(assembly))`，由 `RuntimeContextProjection`
-   作为**一条额外的 user 消息**跟着 claimed 消息一起提交，而且是在 `agent/pre-step`
-   瀑布**之后**才生成——所以表面遮蔽永远追不上它。两端一起做：
+   作为**一条额外的 user 消息**跟着 claimed 消息一起提交。
+
+   **0.2.2-rc.5 的行为变了**：loop 不再把这条消息放进 `agent/pre-step` 的 decision，而是
+   在 `step()` 里自己 `refreshContext(assembly)` → `runtimeContext.project(sections)`，
+   再在 claimed 消息之后 append。因此只过滤 decision 已经拦不住它。三层一起做：
 
    ```js
    // 端一：本作用域不渲染任何动态 context（快照根本不存在）
    ctx.effect(() => ctx.systemPrompt.suppressRuntimeContext(), 'jp-translate: no runtime context')
 
-   // 端二：把 loop 自己那条消息从决策里摘掉（旧会话日志里已经有快照时靠这条兜底）
+   // 端二：decision 里若仍有 runtime-context 消息，摘掉（claimed 原文放行）
    const decision = await next()
-   return stripRuntimeContext(decision)   // 只删 source.kind === 'runtime-context'
+   return stripRuntimeContext(decision)
+
+   // 端三：遮蔽写完以后，把 loop 投影的 retained 置回 undefined
+   resetRuntimeContextRetention(agent)
    ```
 
-   为什么之前是「**每隔一次**」才出现：`RuntimeContextProjection.project()` 只在
-   `retained.text` 与当前快照不同时注入，而 `retained` 会在**快照所在 surface 节点被替换**时
-   置为 `null`（`isReplacementSurfaceEvent` + `sourceEventSeqs` 命中）——我们的历史遮蔽
-   每轮都在替换它。于是「注入 → 被遮蔽置 null → 再注入」交替发生。
+   端三是这次适配新增的。`RuntimeContextProjection` 用私有 `retained` 记住最后一份快照；
+   我们的历史遮蔽每轮都会覆盖那个 surface 节点，而它把「replacement 的
+   `sourceEventSeqs` 命中 retained」解释成「上下文已失效」，于是 `project([])` 每轮都
+   重新发一条 `Current runtime context: none` 清空提醒——请求不再是 `[system][user]`。
+   既然本作用域永远抑制上下文，就没有任何快照需要保留：在 `agent/request` 里、遮蔽之后
+   把 `agent.runtimeContext.retained` 置为 `undefined`，`project([])` 就永远静默。
+
+   `retained` 不是公开服务，而是 loop 实例上的字段（`agentEvents` 会把 `agent` 融合进
+   每个 agent 事件 payload，`agent/request` 拿得到它）。因此 `run-spec.mjs` 会**重新读
+   `dsh-agent-loop` 源码**，断言 `this.runtimeContext = new RuntimeContextProjection(…)`
+   和 `retained;` 字段仍在；改名字就红。`run-preset.mjs` 则用一个带 `runtimeContext`
+   的假 agent 走真实 `agent/request` waterfall，断言 hook 返回前 `retained` 已被清空。
 
    两个细节：
 
@@ -307,15 +360,19 @@ pwsh -File .\dsh-jp-translate\sync-installed.ps1
 
 ## 验证
 
-`tools/dsh-env/` 里放了一份可解析 `@deepseek-ai/*` 的 `node_modules`（从 app.asar 解出），
-用于在本机跑真实 `Session` 的行为验证：
+`tools/dsh-env/` 里放了一份可解析 `@deepseek-ai/*` 的 `node_modules`，由
+`tools/extract-rc5-env.mjs` 从**正在运行的** Desktop `app.asar` 解出，用于在本机跑真实
+`Session` / 真实服务的行为验证。`.dsh-version.json` 记录解出时的 DSH 版本，
+`run-host.mjs` 会把它与当前 `app.asar` 里的 `@deepseek-ai/dsh` 版本**逐字对比**：
+不一致就直接红并提示重跑解出脚本。DSH 升级后先重新解出，否则 spec 测的是旧版本：
 
 ```powershell
+<node> tools/extract-rc5-env.mjs       # 从 app.asar 重新解出当前运行的 DSH 包
 <node> tools/dsh-env/run-spec.mjs     # 提示词 + 无历史不变式 + 「这份日志能加载吗」（真实 Session + 真实读取器）
 <node> tools/dsh-env/run-host.mjs     # host 半加载、预设声明、设置写入后重声明
-<node> tools/dsh-env/run-preset.mjs   # 预设内模块：真实 SystemPrompt 装配、complete 段、pre-step 不写盘、request 遮蔽
+<node> tools/dsh-env/run-preset.mjs   # 预设内模块：真实 SystemPrompt 装配、complete 段、pre-step 不写盘、request 遮蔽 + retained 清理
 <node> tools/dsh-env/run-client.mjs   # 浏览器 bundle：设置页注册、两个文本框、预设增删改
-<node> tools/dsh-env/run-notools.mjs  # 真实汇总：装配出的 tools 必为空，且只对本预设的 agent 生效
+<node> tools/dsh-env/run-notools.mjs  # 真实汇总：步骤准入集合与装配出的 tools 必为空，且只对本预设的 agent 生效
 <node> tools/dsh-env/run-repair.mjs   # 已损坏日志的修复工具：检测、重写、读取器复核、拒绝越权修改
 <node> tools/dsh-env/verify-installed.mjs  # 已安装副本 9 个文件逐字节哈希一致 + 修复标记在位
 ```
@@ -327,10 +384,18 @@ pwsh -File .\dsh-jp-translate\sync-installed.ps1
 `run-spec.mjs` 的关键断言：三轮对话后 `session.deriveMessages()` 恒为
 `[system, user]`，且 user 就是最新一期的原文；三轮写完的日志仍能被
 `assertReleasedV4Relationships()` 加载，而把遮蔽放回 `agent/pre-step` 的位置就会被它
-以线上那句原文拒绝。
+以线上那句原文拒绝。它还重新读 `dsh-agent-loop` 源码，钉住
+`this.runtimeContext = new RuntimeContextProjection(…)` 与 `retained` 字段——契约 6
+的清空动作依赖这两处，改名必须让 spec 变红。
+
+`run-preset.mjs` 另外读源码断言预设**不再**监听 `system-prompt/assemble`（0.2.2-rc.5
+报错的那条路径），并用带 `runtimeContext` 的 agent 走真实 `agent/request` waterfall，
+断言遮蔽之后 `retained` 已被清空。
 
 `run-preset.mjs` / `run-notools.mjs` 用的是**真实服务**（`SystemPrompt`、`ToolRuntime`、
-dsh-scope 作用域链），不是手写替身。教训写在这里：本包先后有三次「测试全绿但线上仍坏」，
-根因都是替身（或复刻的规则）比真实实现简单一级——设置页替身把 `value` 当成字段而不是整个
-section，装配替身把作用域**上下文**当成作用域**键**，无历史替身把 `step/start` 摆在了遮蔽
-之前。凡是能用真实实现的，就不要写替身。
+native tool executor、`tools.resolve()`、dsh-scope 作用域链），不是手写替身。教训写在
+这里：本包先后有三次「测试全绿但线上仍坏」，根因都是替身（或复刻的规则）比真实实现简单
+一级——设置页替身把 `value` 当成字段而不是整个 section，装配替身把作用域**上下文**当成
+作用域**键**，无历史替身把 `step/start` 摆在了遮蔽之前；第四次是测试环境停在
+0.2.0-rc.2 而线上已是 0.2.2-rc.5。凡是能用真实实现的，就不要写替身；凡是能对齐运行
+版本的，就不要留着旧副本。

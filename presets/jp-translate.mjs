@@ -12,36 +12,47 @@
  *
  * 2. NO TOOL DECLARATIONS. A complete prompt section removes the prompt's
  *    *guidance* about tools but not the `tools` array of the request body: the
- *    tool schemas are assembled by `ToolRuntime` into `assembly.tools` and
- *    travel beside the prompt. Two independent suppressions apply, because the
- *    mode is a translation endpoint and must be one on both ends:
+ *    tool schemas travel beside the prompt. Since DSH 0.2.1-rc.2 they are
+ *    declared ONLY from step-admitted registrations: `system-prompt/assemble`
+ *    receives a `PromptPresentation` without a `tools` field, and reading
+ *    `assembly.tools` there is the runtime error this preset hit on
+ *    0.2.2-rc.5 ("Cannot read properties of undefined (reading 'length')").
+ *    The migration (upgrade guide `v0.2.1-rc.2/conditional-tools`) is to make
+ *    the STEP's resolved tool set empty rather than filtering a waterfall:
  *
- *      - the `system-prompt/assemble` waterfall empties `assembly.tools`, so
- *        NO tool declaration reaches the wire whatever any other plugin
- *        contributed (the loop omits the key entirely for an empty array);
  *      - `tools.restrict({ allow: [] })` removes every inherited tool from this
- *        preset scope's capability view, so a name the model invents anyway
- *        cannot resolve and execute (`UNKNOWN_TOOL` instead of a web search).
+ *        preset scope's capability view. `AgentLoop.preStep` calls
+ *        `tools.resolve()` for the proposed step, `ToolRuntime` describes that
+ *        resolved set into the prompt assembly, and an empty set yields an empty
+ *        `assembly.tools` — so NO tool declaration reaches the wire (the loop
+ *        omits the key entirely for an empty array);
+ *      - the same restriction makes a name the model invents anyway fail to
+ *        resolve and execute (`UNKNOWN_TOOL` instead of a web search).
  *
- *    Both are scope-tagged: this listener and this restriction are owned by the
- *    preset's standing scope, which the scope chain places ABOVE each agent
- *    joined to the preset (dsh-scope: layers inherit down the chain, event
- *    admission extends up it). No other agent in the process is affected.
+ *    The restriction is scope-tagged: it is owned by the preset's standing
+ *    scope, which the scope chain places ABOVE each agent joined to the preset
+ *    (dsh-scope: layers inherit down the chain, event admission extends up it).
+ *    No other agent in the process is affected.
  *
  * 3. NO INJECTED RUNTIME CONTEXT. The loop renders the deployment's dynamic
  *    context (file policy, approval policy, sandbox facts, …) and commits it as
  *    an extra USER message beside the claimed input — it is NOT a prompt
- *    section, so neither `complete: true` nor the surface shadow can remove it:
- *    the loop builds it after this hook and appends it with the user messages.
- *    Two suppressions apply here as well:
+ *    section, so neither `complete: true` nor the surface shadow can remove it.
+ *    Three suppressions apply here:
  *
  *      - `systemPrompt.suppressRuntimeContext()` empties the assembly's
  *        contexts, so the snapshot is never rendered for this scope;
- *      - `stripRuntimeContext()` in `agent/pre-step` drops the loop's own
- *        message from the decision, which is what keeps a session whose log
- *        already holds one snapshot clean.
+ *      - `stripRuntimeContext()` in `agent/pre-step` drops any runtime-context
+ *        message from the decision (claimed input passes through untouched);
+ *      - the loop's `RuntimeContextProjection` keeps its own `retained` state
+ *        and, since the loop appends its computed context in `step()` after
+ *        this hook, a snapshot that the surface shadow just covered would make
+ *        it re-emit a "context: none" reminder on EVERY request. The
+ *        `agent/request` hook therefore clears that retained state for the
+ *        suppressed scope once the shadow is written (see
+ *        `resetRuntimeContextRetention`).
  *
- *    The alternation the defect showed is these two mechanisms fighting: the
+ *    The alternation an earlier defect showed was these mechanisms fighting: the
  *    loop re-injects whenever its retained snapshot left the surface, and the
  *    history shadow removes it from the surface every turn.
  *
@@ -73,7 +84,7 @@
 import { randomUUID } from 'node:crypto'
 import z from '@deepseek-ai/schemastery'
 import { buildSystemPrompt, parseState, PROMPT_SECTION, serializeState, defaultState } from '../lib/state.js'
-import { shadowHistory, stripRuntimeContext } from '../lib/shadow.js'
+import { resetRuntimeContextRetention, shadowHistory, stripRuntimeContext } from '../lib/shadow.js'
 
 /** Cordis plugin name. */
 export const name = 'jp-translate'
@@ -106,6 +117,23 @@ export const Config = z.object({
  * keeps it clear that this section is not a contribution to a composed prompt.
  */
 const SECTION_ORDER = 1000
+
+/**
+ * A tool executor that declares nothing.
+ *
+ * Since DSH 0.2.1-rc.2 an executor plugin owns the model-facing tool
+ * declarations, and a PTC executor declares its reserved `run_code` transport
+ * even when no registered tool is visible (`describe()` ignores its argument).
+ * `tools.restrict({ allow: [] })` cannot remove that transport — it refuses the
+ * reserved name. Selecting this stateless executor in the preset scope makes the
+ * declared set empty whatever executor the deployment selected at its root.
+ * Nothing is ever executable here: with no declaration the loop builds no tool
+ * call, and a fabricated call has an empty step admission set.
+ */
+const NO_TOOLS_EXECUTOR = Object.freeze({
+  describe: () => ({ schemas: [] }),
+  execute: () => Promise.reject(new Error('jp-translate: this preset exposes no tools')),
+})
 
 /**
  * Read this row's glossary config.
@@ -143,22 +171,23 @@ export function apply(ctx, config) {
     complete: true,
   }), 'jp-translate: complete system prompt')
 
-  // Tool declaration removal, end one: whatever every tool provider contributed
-  // to `assembly.tools`, the preset-scope listener replaces it with none. This
-  // is the wire guarantee, independent of which plugins registered schemas.
-  ctx.effect(() => ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-    const assembly = await next()
-    return assembly.tools.length === 0 ? assembly : { ...assembly, tools: [] }
-  }), 'jp-translate: no tool declarations')
-
-  // Tool declaration removal, end two: the capability view this preset scope and
-  // every agent under it resolve is emptied, so a tool name the model invents
-  // still cannot execute. Optional injection: with no tool registry composed
-  // there is nothing to restrict, and this plugin must not pend on it.
-  // `restrict()` already registers through the calling context's effect, so its
-  // own disposer needs no second wrapper here.
+  // Tool declaration removal: the capability view this preset scope and every
+  // agent under it resolve is emptied. The loop resolves that view into the
+  // step's `ResolvedToolSet`, and a no-tools executor declares that empty set
+  // into the prompt assembly, so `assembly.tools` stays empty on the wire even
+  // when the deployment selected a PTC executor (whose `describe()` always
+  // declares `run_code`).
+  // There is deliberately NO `system-prompt/assemble` listener any more: since
+  // 0.2.1-rc.2 that waterfall carries no `tools` field, so filtering it (or even
+  // reading `assembly.tools.length`, as this preset used to) throws and fails
+  // the turn — the 0.2.2-rc.5 failure.
+  // Optional injection: with no tool registry composed there is nothing to
+  // restrict or execute, and this plugin must not pend on it.
+  // Both calls register through the calling context's effect, so their own
+  // disposers need no second wrapper here.
   ctx.inject(['tools'], scoped => {
     scoped.tools.restrict({ allow: [] })
+    scoped.tools.setExecutor(NO_TOOLS_EXECUTOR)
   })
 
   // Runtime-context removal, end one: no dynamic context contribution is
@@ -166,10 +195,11 @@ export function apply(ctx, config) {
   // so other agents in the process keep their runtime context.
   ctx.effect(() => ctx.systemPrompt.suppressRuntimeContext(), 'jp-translate: no runtime context')
 
-  // Runtime-context removal, end two: the loop appends its snapshot message
-  // AFTER this hook, as one of the claimed messages, so it has to be filtered
-  // out of the resolved decision. Claimed user text passes through untouched.
-  // Nothing durable is written here — see the `agent/request` hook below.
+  // Runtime-context removal, end two: any runtime-context message a peer hook
+  // puts into the decision is dropped here (claimed user text passes through
+  // untouched). The loop computes and appends its own context in `step()` after
+  // this decision, so this filter alone cannot keep it off the wire — the
+  // retained-state reset in `agent/request` below is what does.
   ctx.effect(() => ctx.on('agent/pre-step', (_payload, next) => (
     Promise.resolve(next()).then(stripRuntimeContext)
   )), 'jp-translate: no injected runtime context')
@@ -194,6 +224,13 @@ export function apply(ctx, config) {
         shadowedStep.set(agent, key)
         shadowHistory(agent, signal, randomUUID, turn, step)
       }
+      // The loop appends the runtime context it computed in `step()` AFTER this
+      // hook, independent of the pre-step decision. Without this reset, the
+      // shadow above covers the retained snapshot, `RuntimeContextProjection`
+      // treats that as "context no longer applies", and re-emits the cleared
+      // reminder on every request. Suppression means there is never a context
+      // to retain, so clearing the retained state is exact for this scope.
+      resetRuntimeContextRetention(agent)
     }
     return next()
   }), 'jp-translate: stateless requests')
