@@ -35,22 +35,22 @@
  *    No other agent in the process is affected.
  *
  * 3. NO INJECTED RUNTIME CONTEXT. The loop renders the deployment's dynamic
- *    context (file policy, approval policy, sandbox facts, …) and commits it as
- *    an extra USER message beside the claimed input — it is NOT a prompt
- *    section, so neither `complete: true` nor the surface shadow can remove it.
- *    Three suppressions apply here:
+ *    context (working directory, file policy, approval policy, sandbox facts, …)
+ *    and commits it as an extra USER message beside the claimed input — it is
+ *    NOT a prompt section, so neither `complete: true` nor the surface shadow
+ *    can remove it. Three suppressions apply here:
  *
  *      - `systemPrompt.suppressRuntimeContext()` empties the assembly's
- *        contexts, so the snapshot is never rendered for this scope;
+ *        OPTIONAL contexts for this scope;
  *      - `stripRuntimeContext()` in `agent/pre-step` drops any runtime-context
  *        message from the decision (claimed input passes through untouched);
- *      - the loop's `RuntimeContextProjection` keeps its own `retained` state
- *        and, since the loop appends its computed context in `step()` after
- *        this hook, a snapshot that the surface shadow just covered would make
- *        it re-emit a "context: none" reminder on EVERY request. The
- *        `agent/request` hook therefore clears that retained state for the
- *        suppressed scope once the shadow is written (see
- *        `resetRuntimeContextRetention`).
+ *      - `silenceRuntimeContext()` in `agent/request` clears the loop
+ *        projection's `retained` state AND replaces its `project` method with a
+ *        no-op. This step is load-bearing because suppression deliberately
+ *        keeps `required: true` contributions — the shipped
+ *        `working-directory:current` is required and its assemble listener
+ *        re-adds it after the waterfall — and because since 0.2.2-rc.5 the loop
+ *        projects and appends the context in `step()` after `agent/pre-step`.
  *
  *    The alternation an earlier defect showed was these mechanisms fighting: the
  *    loop re-injects whenever its retained snapshot left the surface, and the
@@ -84,7 +84,7 @@
 import { randomUUID } from 'node:crypto'
 import z from '@deepseek-ai/schemastery'
 import { buildSystemPrompt, parseState, PROMPT_SECTION, serializeState, defaultState } from '../lib/state.js'
-import { resetRuntimeContextRetention, shadowHistory, stripRuntimeContext } from '../lib/shadow.js'
+import { shadowHistory, silenceRuntimeContext, stripRuntimeContext } from '../lib/shadow.js'
 
 /** Cordis plugin name. */
 export const name = 'jp-translate'
@@ -225,12 +225,13 @@ export function apply(ctx, config) {
         shadowHistory(agent, signal, randomUUID, turn, step)
       }
       // The loop appends the runtime context it computed in `step()` AFTER this
-      // hook, independent of the pre-step decision. Without this reset, the
-      // shadow above covers the retained snapshot, `RuntimeContextProjection`
-      // treats that as "context no longer applies", and re-emits the cleared
-      // reminder on every request. Suppression means there is never a context
-      // to retain, so clearing the retained state is exact for this scope.
-      resetRuntimeContextRetention(agent)
+      // hook, independent of the pre-step decision. `suppressRuntimeContext()`
+      // only removes optional contributions; the shipped working-directory
+      // context is `required: true`, so assembly keeps it and the request would
+      // carry a second user message ("Current working directory: …") beside the
+      // source text. Silencing the projection's `project` method is the only
+      // place that guarantees no context message is produced for this agent.
+      silenceRuntimeContext(agent)
     }
     return next()
   }), 'jp-translate: stateless requests')

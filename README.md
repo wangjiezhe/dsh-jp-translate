@@ -31,10 +31,12 @@ UNKNOWN
 `describe() => ({ schemas: [] })` 的 no-tools 执行器——这样连 PTC 的保留 `run_code`
 传输也不会被声明，见下文契约 5。
 
-同一轮升级还暴露了第二个 0.2.2-rc.5 变更：loop 改为在 `step()` 里自行投影 runtime
-context 并 append，`agent/pre-step` 过滤 decision 已拦不住它；且历史遮蔽每轮覆盖快照节点
-会让 `RuntimeContextProjection` 每轮重发「context: none」清空提醒。插件现在在
-`agent/request` 里清掉 loop 的 `retained` 状态（契约 6 的端三）。
+同一轮升级还暴露了第二个问题：loop 改为在 `step()` 里自行投影 runtime context 并 append，
+`agent/pre-step` 过滤 decision 已拦不住它；更关键的是 `suppressRuntimeContext()` 只移除
+**可选** context，而当前发行版的 `working-directory:current` 是 `required: true`，还会被
+自己的 assemble 监听器重新塞回去——所以请求仍会多一条
+`Current working directory: …` 的 user 消息。插件现在在 `agent/request` 里把 loop 的
+`project` 方法换成 no-op 并清掉 `retained`（契约 6 的端三），这条消息才真正消失。
 
 测试环境也一起迁到了 0.2.2-rc.5：`tools/dsh-env/node_modules` 由
 `tools/extract-rc5-env.mjs` 从**正在运行的** `app.asar` 解出（`.dsh-version.json` 记录
@@ -219,9 +221,9 @@ client.js               浏览器半：设置页（两个文本框 + 预设管�
    这是 harness 自己写的事实变更记录，我们的遮蔽在它之前执行、够不到它；下一轮起它就被
    遮蔽了。**新建会话永远是干净的 `[system][user]`**。
 
-6. **「不发运行时上下文」在 0.2.2-rc.5 多了一条：必须清掉 loop 的 `retained` 状态。**
-   请求里多出来的那条 user 消息（`Current runtime context…`）不是提示词段，也不是
-   surface 上的历史：`dsh-agent-loop` 自己渲染
+6. **「不发运行时上下文」的最终保证在 loop 的 projection 上：`suppressRuntimeContext()` 压不掉 `required` context。**
+   请求里多出来的那条 user 消息（`<system-reminder>…Current working directory…`）不是提示词段，
+   也不是 surface 上的历史：`dsh-agent-loop` 自己渲染
    `joinContextSections(renderContextSections(assembly))`，由 `RuntimeContextProjection`
    作为**一条额外的 user 消息**跟着 claimed 消息一起提交。
 
@@ -230,35 +232,50 @@ client.js               浏览器半：设置页（两个文本框 + 预设管�
    再在 claimed 消息之后 append。因此只过滤 decision 已经拦不住它。三层一起做：
 
    ```js
-   // 端一：本作用域不渲染任何动态 context（快照根本不存在）
+   // 端一：本作用域不渲染 OPTIONAL 动态 context
    ctx.effect(() => ctx.systemPrompt.suppressRuntimeContext(), 'jp-translate: no runtime context')
 
    // 端二：decision 里若仍有 runtime-context 消息，摘掉（claimed 原文放行）
    const decision = await next()
    return stripRuntimeContext(decision)
 
-   // 端三：遮蔽写完以后，把 loop 投影的 retained 置回 undefined
-   resetRuntimeContextRetention(agent)
+   // 端三：在 step() 投影之前，把 loop 的 project 换成 no-op（并清掉 retained）
+   silenceRuntimeContext(agent)
    ```
 
-   端三是这次适配新增的。`RuntimeContextProjection` 用私有 `retained` 记住最后一份快照；
-   我们的历史遮蔽每轮都会覆盖那个 surface 节点，而它把「replacement 的
-   `sourceEventSeqs` 命中 retained」解释成「上下文已失效」，于是 `project([])` 每轮都
-   重新发一条 `Current runtime context: none` 清空提醒——请求不再是 `[system][user]`。
-   既然本作用域永远抑制上下文，就没有任何快照需要保留：在 `agent/request` 里、遮蔽之后
-   把 `agent.runtimeContext.retained` 置为 `undefined`，`project([])` 就永远静默。
+   **为什么端一不够。** `suppressRuntimeContext()` 的文档与实现都只移除**可选** context：
+   `required: true` 的贡献会被保留。当前发行版的 `dsh-working-directory` 正是
+   `required: true`，而且它的 `system-prompt/assemble` 监听器会在 waterfall 返回前**再把
+   `working-directory:current` 塞回 `assembly.contexts`**。于是即使抑制生效，请求仍会多一条
+   `Current working directory: "…"`，模型看到 `[system][user][user]` 后去回答那条提醒，
+   翻译失败。`dsh-tool-subagent*` 的 context 也是 required。
 
-   `retained` 不是公开服务，而是 loop 实例上的字段（`agentEvents` 会把 `agent` 融合进
-   每个 agent 事件 payload，`agent/request` 拿得到它）。因此 `run-spec.mjs` 会**重新读
-   `dsh-agent-loop` 源码**，断言 `this.runtimeContext = new RuntimeContextProjection(…)`
-   和 `retained;` 字段仍在；改名字就红。`run-preset.mjs` 则用一个带 `runtimeContext`
-   的假 agent 走真实 `agent/request` waterfall，断言 hook 返回前 `retained` 已被清空。
+   **端三为什么是投影而不是 assembly。** 既然 required context 会穿过 assembly，唯一还
+   能保证「不产生消息」的位置就是 loop 实例上的 `RuntimeContextProjection.project`：
+   `step()` 里 `const context = this.runtimeContext.project(sections)`，返回
+   `undefined` 就不会 append。`silenceRuntimeContext()` 把 `agent.runtimeContext.retained`
+   清空，并把 `project` 换成 `() => undefined`；它只在 `agent/request` 里、历史遮蔽之后
+   执行，作用于单个 agent，别的 agent 的运行时上下文照常。
+
+   `retained` 的清理仍然保留：历史遮蔽每轮覆盖快照节点，projection 会把「replacement 的
+   `sourceEventSeqs` 命中 retained」解释成「上下文已失效」，在方法补丁不可用时每轮重发
+   `Current runtime context: none`。补丁与清空一起做，新建会话与恢复会话都只剩
+   `[system][user]`。
+
+   `runtimeContext` 不是公开服务，而是 loop 实例上的字段（`agentEvents` 会把 `agent`
+   融合进每个 agent 事件 payload，`agent/request` 拿得到它）。因此 `run-spec.mjs` 会
+   **重新读 `dsh-agent-loop` 源码**，断言 `this.runtimeContext = new RuntimeContextProjection(…)`、
+   `retained` 字段、`project(sections)` 方法以及那行 append 都还在；改名字就红。
+   `run-preset.mjs` 则用一个带 `runtimeContext`（含 `project`）的假 agent 走真实
+   `agent/request` waterfall，断言 hook 返回前 `retained` 已清空、`project([])` 返回
+   `undefined`。`run-notools.mjs` 用一个 required context 证明「assembly 会留下它」，
+   从而说明端三不可省。
 
    两个细节：
 
    - `suppressRuntimeContext()` 的判定是**整条 scope 链上有一个抑制者就全抑制**
      （`scopeLayers.some(...)`），所以它也能压掉 `dsh-sandbox-policy`、`dsh-user-approval`
-     注册在 agent scope 上的 context；同时它是 scope 级的，别的 agent 不受影响。
+     注册在 agent scope 上的可选 context；同时它是 scope 级的，别的 agent 不受影响。
    - `stripRuntimeContext()` **只删那一个生产者**的消息，claimed 的用户原文（包括被别的插件
      改写过的版本）一律放行——越权过滤会丢用户正文。
 
@@ -370,9 +387,9 @@ pwsh -File .\dsh-jp-translate\sync-installed.ps1
 <node> tools/extract-rc5-env.mjs       # 从 app.asar 重新解出当前运行的 DSH 包
 <node> tools/dsh-env/run-spec.mjs     # 提示词 + 无历史不变式 + 「这份日志能加载吗」（真实 Session + 真实读取器）
 <node> tools/dsh-env/run-host.mjs     # host 半加载、预设声明、设置写入后重声明
-<node> tools/dsh-env/run-preset.mjs   # 预设内模块：真实 SystemPrompt 装配、complete 段、pre-step 不写盘、request 遮蔽 + retained 清理
+<node> tools/dsh-env/run-preset.mjs   # 预设内模块：真实 SystemPrompt 装配、complete 段、pre-step 不写盘、request 遮蔽 + projection 静音
 <node> tools/dsh-env/run-client.mjs   # 浏览器 bundle：设置页注册、两个文本框、预设增删改
-<node> tools/dsh-env/run-notools.mjs  # 真实汇总：步骤准入集合与装配出的 tools 必为空，且只对本预设的 agent 生效
+<node> tools/dsh-env/run-notools.mjs  # 真实汇总：步骤准入集合与装配出的 tools 必为空，required context 仍会留存（故需端三）
 <node> tools/dsh-env/run-repair.mjs   # 已损坏日志的修复工具：检测、重写、读取器复核、拒绝越权修改
 <node> tools/dsh-env/verify-installed.mjs  # 已安装副本 9 个文件逐字节哈希一致 + 修复标记在位
 ```
@@ -385,12 +402,15 @@ pwsh -File .\dsh-jp-translate\sync-installed.ps1
 `[system, user]`，且 user 就是最新一期的原文；三轮写完的日志仍能被
 `assertReleasedV4Relationships()` 加载，而把遮蔽放回 `agent/pre-step` 的位置就会被它
 以线上那句原文拒绝。它还重新读 `dsh-agent-loop` 源码，钉住
-`this.runtimeContext = new RuntimeContextProjection(…)` 与 `retained` 字段——契约 6
-的清空动作依赖这两处，改名必须让 spec 变红。
+`this.runtimeContext = new RuntimeContextProjection(…)`、`retained` 字段、
+`project(sections)` 方法以及`const context = this.runtimeContext.project(sections)` 那行
+— 契约 6 的静音动作依赖这些，改名必须让 spec 变红。
 
 `run-preset.mjs` 另外读源码断言预设**不再**监听 `system-prompt/assemble`（0.2.2-rc.5
-报错的那条路径），并用带 `runtimeContext` 的 agent 走真实 `agent/request` waterfall，
-断言遮蔽之后 `retained` 已被清空。
+报错的那条路径），并用带 `runtimeContext`（含 `project`）的 agent 走真实
+`agent/request` waterfall，断言遮蔽之后 `retained` 已清空、`project([])` 返回
+`undefined`。`run-notools.mjs` 再用一个 `required: true` context 证明 assembly 会把它
+留下，从而说明「只靠 suppressRuntimeContext 不够」。
 
 `run-preset.mjs` / `run-notools.mjs` 用的是**真实服务**（`SystemPrompt`、`ToolRuntime`、
 native tool executor、`tools.resolve()`、dsh-scope 作用域链），不是手写替身。教训写在
